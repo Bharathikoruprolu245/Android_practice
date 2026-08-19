@@ -1,0 +1,10 @@
+.env
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+*.pyd
+biomedix.db
+*.sqlite
+*.sqlite3
+.DS_Store

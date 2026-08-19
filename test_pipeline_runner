@@ -1,0 +1,179 @@
+"""
+Unit tests for Module 4 (PipelineRunner and generate_verdict).
+
+Run with:  pytest test_pipeline_runner.py -v
+
+Mocks out STRING DB (Module 1), RCSB structure lookup, and NCBI (Module 3)
+so the suite runs offline and fast, same convention as test_pipeline.py and
+test_crispr_safety.py. A local PostgreSQL instance IS required.
+
+Point TEST_DATABASE_URL at a scratch database before running, e.g.:
+    export TEST_DATABASE_URL="postgresql://biomedix_user:password@localhost:5432/biomedix_test_db"
+The fixture does a full Database.reset() before/after each test, since a
+full pipeline run touches Modules 1-4's tables together.
+"""
+
+import os
+import pytest
+from unittest.mock import patch
+
+from data_ingestor import DataIngestor, MockGeneProvider
+from network_analyzer import NetworkAnalyzer
+from target_discovery import TargetDiscoveryPipeline
+
+from structural_ml import PocketDetector, FeatureExtractor, DruggabilityEngine, DruggabilityPipeline
+from crispr_safety import SequenceFetcher, OffTargetScanner, CrisprSafetyEngine, CrisprSafetyPipeline
+
+from pipeline_runner import PipelineRunner, generate_verdict, IntegratedReport
+from structural_ml import DruggabilityResult
+from crispr_safety import CrisprSafetyResult
+from db import Database
+
+TEST_DATABASE_URL = os.environ.get(
+    "TEST_DATABASE_URL",
+    "postgresql://biomedix_user:password@localhost:5432/biomedix_test_db",
+)
+
+FAKE_RICE_EDGES = [
+    ("OsNramp5", "OsLsi2", 900),
+    ("OsNramp5", "OsHMA3", 850),
+    ("OsHMA3", "OsHMA2", 700),
+]
+
+FAKE_SEQUENCE = (
+    "ATGGCTGAGCTGGATCCGTTCGGCTCGATCGGATCCGTAGCTAGCTAGGCTAGCATCGATCGATCG"
+    "GGATCCAAGCTTGGATCCGAATTCGAGCTCGGTACCCGGGGATCCTCTAGAGTCGACCTGCAGGCA"
+)
+GUIDE_WITH_PAM = "GATCGGATCCGTAGCTAGCT"  # 20nt, PAM-adjacent exact match in FAKE_SEQUENCE
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def temp_db():
+    db = Database(TEST_DATABASE_URL)
+    db.reset()
+    yield db
+    db.reset()
+    db.close()
+
+
+@pytest.fixture
+def runner(temp_db):
+    ingestor = DataIngestor(gene_provider=MockGeneProvider())
+    target_pipeline = TargetDiscoveryPipeline(
+        ingestor=ingestor, analyzer=NetworkAnalyzer(), db=temp_db
+    )
+    # No fpocket/trained models in CI -> detector=None, engine has no model
+    # loaded, both exercising the documented fallback paths.
+    druggability_pipeline = DruggabilityPipeline(
+        detector=None, extractor=FeatureExtractor(), engine=DruggabilityEngine(), db=temp_db
+    )
+    crispr_pipeline = CrisprSafetyPipeline(
+        fetcher=SequenceFetcher(), scanner=OffTargetScanner(), engine=CrisprSafetyEngine(), db=temp_db
+    )
+    return PipelineRunner(
+        target_pipeline=target_pipeline,
+        druggability_pipeline=druggability_pipeline,
+        crispr_pipeline=crispr_pipeline,
+        db=temp_db,
+    )
+
+
+# ---------------------------------------------------------------------------
+# generate_verdict — pure logic, no mocking needed
+# ---------------------------------------------------------------------------
+class TestGenerateVerdict:
+    def _drug(self, score):
+        return DruggabilityResult(gene_symbol="G", pdb_id=None, druggability_score=score)
+
+    def _crispr(self, score):
+        return CrisprSafetyResult(gene_symbol="G", guide_rna="X" * 20, safety_score=score)
+
+    def test_strong_candidate(self):
+        v = generate_verdict(self._drug(0.8), self._crispr(0.8))
+        assert "Strong candidate" in v
+
+    def test_druggable_but_risky_editing(self):
+        v = generate_verdict(self._drug(0.8), self._crispr(0.4))
+        assert "elevated off-target risk" in v
+
+    def test_undruggable_but_safe_editing(self):
+        v = generate_verdict(self._drug(0.3), self._crispr(0.8))
+        assert "gene-editing route appears safer" in v
+
+    def test_neither_pathway_promising(self):
+        v = generate_verdict(self._drug(0.3), self._crispr(0.3))
+        assert "Neither pathway" in v
+
+    def test_no_grna_reflects_druggability_only(self):
+        v = generate_verdict(self._drug(0.8), None)
+        assert "no gRNA supplied" in v
+        assert "Promising" in v
+
+
+# ---------------------------------------------------------------------------
+# PipelineRunner — end-to-end, external APIs mocked out
+# ---------------------------------------------------------------------------
+class TestPipelineRunner:
+    def test_run_without_grna_skips_module3(self, runner):
+        with patch.object(
+            runner.target_pipeline.ingestor, "fetch_string_interactions", return_value=FAKE_RICE_EDGES
+        ), patch("pipeline_runner.fetch_best_structure", return_value=None):
+            report = runner.run_full_pipeline("rice cadmium toxicity", guide_rna=None, species="rice")
+
+        assert isinstance(report, IntegratedReport)
+        assert report.crispr_result is None
+        assert report.druggability_result.used_fallback is True  # no structure -> heuristic
+        assert "no gRNA supplied" in report.verdict
+
+    def test_run_with_grna_runs_both_modules_concurrently(self, runner):
+        with patch.object(
+            runner.target_pipeline.ingestor, "fetch_string_interactions", return_value=FAKE_RICE_EDGES
+        ), patch("pipeline_runner.fetch_best_structure", return_value=None), patch.object(
+            runner.crispr_pipeline.fetcher, "fetch_sequence", return_value=("DEMO_ACC", FAKE_SEQUENCE)
+        ):
+            report = runner.run_full_pipeline(
+                "rice cadmium toxicity", guide_rna=GUIDE_WITH_PAM, species="rice"
+            )
+
+        assert report.crispr_result is not None
+        assert report.crispr_result.used_fallback in (True, False)  # interim heuristic or CNN
+        assert report.hub_result.hub_gene_symbol in ("OsNramp5", "OsHMA3")
+
+    def test_run_persists_integrated_report(self, runner, temp_db):
+        with patch.object(
+            runner.target_pipeline.ingestor, "fetch_string_interactions", return_value=FAKE_RICE_EDGES
+        ), patch("pipeline_runner.fetch_best_structure", return_value=None), patch.object(
+            runner.crispr_pipeline.fetcher, "fetch_sequence", return_value=("DEMO_ACC", FAKE_SEQUENCE)
+        ):
+            report = runner.run_full_pipeline(
+                "rice cadmium toxicity", guide_rna=GUIDE_WITH_PAM, species="rice"
+            )
+
+        assert report.report_id is not None
+        rows = temp_db.fetch_all("INTEGRATED_REPORT")
+        assert len(rows) == 1
+        assert rows[0]["run_id"] == report.hub_result.run_id
+        assert rows[0]["druggability_result_id"] == report.druggability_result.result_id
+        assert rows[0]["crispr_result_id"] == report.crispr_result.result_id
+
+        full = temp_db.get_integrated_report(report.report_id)
+        assert full["disease_name"] == "rice cadmium toxicity"
+        assert full["hub_gene_symbol"] == report.hub_result.hub_gene_symbol
+
+    def test_module2_structure_lookup_failure_falls_back_gracefully(self, runner):
+        """fetch_best_structure raising/returning None should never crash
+        the run — Module 2's own documented fallback should kick in."""
+        with patch.object(
+            runner.target_pipeline.ingestor, "fetch_string_interactions", return_value=FAKE_RICE_EDGES
+        ), patch("pipeline_runner.fetch_best_structure", return_value=None):
+            report = runner.run_full_pipeline("rice cadmium toxicity", species="rice")
+
+        assert report.druggability_result.used_fallback is True
+        assert report.druggability_result.druggability_score == 0.3  # fallback_heuristic_score
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

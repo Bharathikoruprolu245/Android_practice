@@ -1,0 +1,35 @@
+# BioMedix-AI local PostgreSQL setup
+#
+# Usage:
+#   docker compose up -d
+#   docker compose down            # stop (keeps data)
+#   docker compose down -v         # stop AND wipe all data
+#
+# This creates TWO databases in one Postgres 16 container:
+#   biomedix_db       - main development database (DATABASE_URL)
+#   biomedix_test_db  - scratch database for pytest (TEST_DATABASE_URL)
+#
+# Matches the connection strings in .env.example.
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: biomedix-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: biomedix_user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: biomedix_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - biomedix_pgdata:/var/lib/postgresql/data
+      - ./docker/init-multiple-dbs.sh:/docker-entrypoint-initdb.d/init-multiple-dbs.sh
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U biomedix_user -d biomedix_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  biomedix_pgdata:
